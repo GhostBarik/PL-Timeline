@@ -10,6 +10,8 @@ import scala.collection.parallel.immutable.ParSeq
 import scala.collection.immutable.Set
 import scala.collection.immutable.Map
 
+import util.Properties
+
 /**
   * Created by ghostbarik on 7/12/16.
   */
@@ -23,60 +25,83 @@ object Main {
 
   var visitedUrls = Set[URL]()
   var graphOfLanguages = Map[URL, Set[URL]]()
-//  var pageByUrl = Map[URL, WikiPage]()
+  var languageNameByUrl = Map[URL, String]()
 
   implicit val executionContext = new ForkJoinTaskSupport(
     new scala.concurrent.forkjoin.ForkJoinPool(8)
   )
 
-
   def main(args: Array[String]) {
 
-//
+    // starting page
     val firstPage = WikiPage(wikiDomain + "/wiki/Java_(programming_language)", external = false, "Java")
 
     scanPages(firstPage, fetchHtml(firstPage.url))
 
-//    for ((k,v) <- graphOfLanguages) {
-//      println( (k,v) )
-//    }
-
-    //println("visited: " + visitedUrls.size)
-    println(toDotFormat(graphOfLanguages))
+    println(toJsFormat(graphOfLanguages))
   }
 
   def toDotFormat(graph: Map[URL, Set[URL]]): String = {
 
-    def escapeString(s: String) = s
-      .replace("programming_language", "")
-      .replace("()", "").replace(wikiDomain, "")
-      .replace("/wiki/", "")
-      .replace("_","")
+    def escapeItem(s: String) = "\"" + s.replace("\"\"", "") + "\""
 
-    val escaped = graph.map{case (k, v) => (escapeString(k), v.map(escapeString(_))) }
+    val escaped = graph.map{ case (k, v) =>
+      languageNameByUrl(k) -> v.map(languageNameByUrl)
+    }
 
-    println(escaped)
+    val res = for ((k,v) <- escaped; elem <- v)
+      yield escapeItem(k) + " -> " + escapeItem(elem) + ";"
 
-    val res = escaped.flatMap{ case (k,v) => v.map(elem => k + " -> " + elem + ";")}.mkString("\n")
-    "digraph G {" + res + "}"
+    "digraph G {" + Properties.lineSeparator + res.mkString(Properties.lineSeparator) + "}"
   }
 
-  def scanPages(startW: WikiPage, from: Document): Unit = {
+  def toJsFormat(graph: Map[URL, Set[URL]]): String = {
 
-    val nextPages: List[WikiPage] = parseHtml(from)
+    def escapeItem(s: String) = "\"" + s.replace("\"\"", "") + "\""
 
-    val parsed = parsePages(startW, nextPages.filter{ page =>
+    val escaped = graph.map{ case (k, v) =>
+      languageNameByUrl(k) -> v.map(languageNameByUrl)
+    }
 
-        graphOfLanguages.get(startW.url) match {
+    val allKeys = escaped.keySet ++ escaped.values.flatten.toSet
 
-          case Some(l: Set[URL]) =>
-            graphOfLanguages += (startW.url -> (l + page.url))
+    val nodes = allKeys.map { k =>
+      val esc = escapeItem(k)
+      s"{ data: { id: $esc, name: $esc } }"
+    }
 
-          case None =>
-            graphOfLanguages += (startW.url -> Set(page.url))
-        }
+    val edges = for ((k,v) <- escaped; elem <- v)
+      yield {
+        val escK = escapeItem(k)
+        val escV = escapeItem(elem)
+        s"{ data: { source: $escK, target: $escV } }"
+      }
 
-        !(visitedUrls contains page.url)
+    def makeObject(key: String, inner: String) = Seq(s"$key: {", inner, "}")
+      .mkString("", Properties.lineSeparator, Properties.lineSeparator)
+
+    def makeArray(key: String, inner: String) = Seq(s"$key: [", inner, "]")
+      .mkString("", Properties.lineSeparator, Properties.lineSeparator)
+
+    makeObject("elements",
+      makeArray("nodes", nodes.mkString("," + Properties.lineSeparator)) + "," +
+        makeArray("edges", edges.mkString("," + Properties.lineSeparator)))
+  }
+
+  def scanPages(startPage: WikiPage, pageContent: Document): Unit = {
+
+    val nextPages: List[WikiPage] = parseHtml(pageContent)
+
+    languageNameByUrl += (startPage.url -> startPage.language)
+
+    val parsed = parsePages(startPage, nextPages.filter{ nextPage =>
+
+      linkTwoPages(startPage, nextPage)
+
+      languageNameByUrl += (nextPage.url -> nextPage.language)
+
+        !(visitedUrls contains nextPage.url)
+
       }.filter(!_.external))
 
       for ((d,w) <- parsed) {
@@ -86,40 +111,39 @@ object Main {
         }
         scanPages(w,d)
       }
-
-
   }
 
+
+  def linkTwoPages(first: WikiPage, second: WikiPage) = {
+
+    graphOfLanguages.get(first.url) match {
+
+      case Some(l: Set[URL]) =>
+        graphOfLanguages += (first.url -> (l + second.url))
+
+      case None =>
+        graphOfLanguages += (first.url -> Set(second.url))
+    }
+  }
 
 
 
   case class WikiPage(url: URL, external: Boolean, language: String)
 
-  def fetchHtml(url: URL): Document = {
+  def fetchHtml(url: URL): Document = JsoupBrowser().get(url)
 
-    println("fetching url: " + url)
+  def parsePages(from: WikiPage, nextPages: List[WikiPage]): List[(Document, WikiPage)] = {
 
-    JsoupBrowser().get(url)
-  }
-
-  def parsePages(from: WikiPage, pages: List[WikiPage]): List[(Document, WikiPage)] = {
-
-    val results = pages.map{p =>
-
+    val results = inParallel(nextPages).map{ p =>
 
       this.synchronized {
-
         visitedUrls += p.url
-
         println("visiting: " + p.url)
       }
-
-
 
       (fetchHtml(p.url), p)
 
     }.seq
-
 
     results.toList
   }
@@ -145,6 +169,10 @@ object Main {
 
       val languages = rightContentBlock(index + 1) >> elementList("a")
 
+      def unify(s: String): String = s
+        .replace("(programming_language)", "programming_language")
+        .replace("programming_language", "(programming_language)")
+
       for {
         elem <- languages
         if !(elem.attr("href") contains "cite_note")
@@ -152,9 +180,8 @@ object Main {
         if !elem.attrs.get("class").contains("new")
 
       } yield WikiPage(
-        wikiDomain + elem.attr("href")
-        .replace("(programming_language)", "programming_language")
-        .replace("programming_language", "(programming_language)"),
+
+        wikiDomain + unify(elem.attr("href")),
         !elem.attr("href").contains("/wiki"),
         elem.innerHtml
       )
