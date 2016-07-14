@@ -1,36 +1,32 @@
+import Model.{URL, WikiPage}
 import net.ruippeixotog.scalascraper.browser.JsoupBrowser
-import net.ruippeixotog.scalascraper.model.{Document, Element}
-import net.ruippeixotog.scalascraper.dsl.DSL._
 import net.ruippeixotog.scalascraper.dsl.DSL.Extract._
-import net.ruippeixotog.scalascraper.dsl.DSL.Parse._
+import net.ruippeixotog.scalascraper.dsl.DSL._
+import net.ruippeixotog.scalascraper.model.Document
 
-import scala.collection.parallel.{ForkJoinTaskSupport, TaskSupport}
+import scala.collection.immutable.{Map, Set}
+import scala.collection.parallel.TaskSupport
 import scala.collection.parallel.immutable.ParSeq
 
-import scala.collection.immutable.Set
-import scala.collection.immutable.Map
-
-import util.Properties
-
 /**
-  * Created by ghostbarik on 7/12/16.
+  * Main script
   */
 object Main {
 
-  // type alias for URL
-  type URL = String
+  import Config.executionContext
 
   // url of the wikipedia main domain
   val wikiDomain = "https://en.wikipedia.org"
 
   var visitedUrls = Set[URL]()
-  var graphOfLanguages = Map[URL, Set[URL]]()
+  var graphOfLanguages = Map[URL, Set[URL]]().withDefault(_ => Set.empty[URL])
   var languageNameByUrl = Map[URL, String]()
 
-  implicit val executionContext = new ForkJoinTaskSupport(
-    new scala.concurrent.forkjoin.ForkJoinPool(8)
-  )
+  def fetchHtml(url: URL): Document = JsoupBrowser().get(url)
 
+  /**
+    * script entry point
+    */
   def main(args: Array[String]) {
 
     // starting page
@@ -38,54 +34,11 @@ object Main {
 
     scanPages(firstPage, fetchHtml(firstPage.url))
 
-    println(toJsFormat(graphOfLanguages))
-  }
-
-  def toDotFormat(graph: Map[URL, Set[URL]]): String = {
-
-    def escapeItem(s: String) = "\"" + s.replace("\"\"", "") + "\""
-
-    val escaped = graph.map{ case (k, v) =>
+    val escaped: Map[String, Set[String]] = graphOfLanguages.map{ case (k, v) =>
       languageNameByUrl(k) -> v.map(languageNameByUrl)
     }
 
-    val res = for ((k,v) <- escaped; elem <- v)
-      yield escapeItem(k) + " -> " + escapeItem(elem) + ";"
-
-    "digraph G {" + Properties.lineSeparator + res.mkString(Properties.lineSeparator) + "}"
-  }
-
-  def toJsFormat(graph: Map[URL, Set[URL]]): String = {
-
-    def escapeItem(s: String) = "\"" + s.replace("\"\"", "") + "\""
-
-    val escaped = graph.map{ case (k, v) =>
-      languageNameByUrl(k) -> v.map(languageNameByUrl)
-    }
-
-    val allKeys = escaped.keySet ++ escaped.values.flatten.toSet
-
-    val nodes = allKeys.map { k =>
-      val esc = escapeItem(k)
-      s"{ data: { id: $esc, name: $esc } }"
-    }
-
-    val edges = for ((k,v) <- escaped; elem <- v)
-      yield {
-        val escK = escapeItem(k)
-        val escV = escapeItem(elem)
-        s"{ data: { source: $escK, target: $escV } }"
-      }
-
-    def makeObject(key: String, inner: String) = Seq(s"$key: {", inner, "}")
-      .mkString("", Properties.lineSeparator, Properties.lineSeparator)
-
-    def makeArray(key: String, inner: String) = Seq(s"$key: [", inner, "]")
-      .mkString("", Properties.lineSeparator, Properties.lineSeparator)
-
-    makeObject("elements",
-      makeArray("nodes", nodes.mkString("," + Properties.lineSeparator)) + "," +
-        makeArray("edges", edges.mkString("," + Properties.lineSeparator)))
+    println(Converters.toJsFormat(escaped))
   }
 
   def scanPages(startPage: WikiPage, pageContent: Document): Unit = {
@@ -96,7 +49,8 @@ object Main {
 
     val parsed = parsePages(startPage, nextPages.filter{ nextPage =>
 
-      linkTwoPages(startPage, nextPage)
+      //linkTwoPages(startPage, nextPage)
+      graphOfLanguages += (startPage.url -> (graphOfLanguages(startPage.url) + nextPage.url))
 
       languageNameByUrl += (nextPage.url -> nextPage.language)
 
@@ -105,32 +59,9 @@ object Main {
       }.filter(!_.external))
 
       for ((d,w) <- parsed) {
-
-        if (w.url == "https://en.wikipedia.org/wiki/R_(programming_language)") {
-          val a = "test"
-        }
         scanPages(w,d)
       }
   }
-
-
-  def linkTwoPages(first: WikiPage, second: WikiPage) = {
-
-    graphOfLanguages.get(first.url) match {
-
-      case Some(l: Set[URL]) =>
-        graphOfLanguages += (first.url -> (l + second.url))
-
-      case None =>
-        graphOfLanguages += (first.url -> Set(second.url))
-    }
-  }
-
-
-
-  case class WikiPage(url: URL, external: Boolean, language: String)
-
-  def fetchHtml(url: URL): Document = JsoupBrowser().get(url)
 
   def parsePages(from: WikiPage, nextPages: List[WikiPage]): List[(Document, WikiPage)] = {
 
